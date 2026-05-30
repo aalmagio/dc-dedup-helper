@@ -1,0 +1,6 @@
+{
+  "dedup_url_template": "https://dc.directchannel.it/nonprofit/nomi_merge.asp?id_cedente={id_cedente}&id_vincente={id_vincente}",
+  "dedup_link_label": "Deduplica",
+  "saved_mapping_file": ".dedup_last_mapping.json",
+  "name_similarity_threshold": 0.8
+}

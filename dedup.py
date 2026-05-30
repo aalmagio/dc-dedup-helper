@@ -7,7 +7,16 @@ import pandas as pd
 
 
 EXCEL_EXT = (".xlsx", ".xlsm", ".xls")
-MAPPING_CONFIG_FILE = ".dedup_last_mapping.json"
+APP_CONFIG_FILE = "dedup_config.json"
+DEFAULT_CONFIG = {
+    "dedup_url_template": (
+        "https://dc.directchannel.it/nonprofit/nomi_merge.asp"
+        "?id_cedente={id_cedente}&id_vincente={id_vincente}"
+    ),
+    "dedup_link_label": "Deduplica",
+    "saved_mapping_file": ".dedup_last_mapping.json",
+    "name_similarity_threshold": 0.8,
+}
 
 
 def find_excel_files(path="."):
@@ -75,12 +84,37 @@ def choose_from_list(options, message):
     return choice - 1
 
 
-def get_mapping_config_path():
-    return os.path.join(os.getcwd(), MAPPING_CONFIG_FILE)
+def load_app_config():
+    config = DEFAULT_CONFIG.copy()
+    path = os.path.join(os.getcwd(), APP_CONFIG_FILE)
+
+    if not os.path.isfile(path):
+        return config
+
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            user_config = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        print(f"Attenzione: non riesco a leggere {APP_CONFIG_FILE}, userò i valori di default.")
+        return config
+
+    if not isinstance(user_config, dict):
+        print(f"Attenzione: {APP_CONFIG_FILE} non contiene un oggetto JSON valido, userò i default.")
+        return config
+
+    for key in DEFAULT_CONFIG:
+        if key in user_config:
+            config[key] = user_config[key]
+
+    return config
 
 
-def load_saved_mapping():
-    path = get_mapping_config_path()
+def get_mapping_config_path(config):
+    return os.path.join(os.getcwd(), str(config["saved_mapping_file"]))
+
+
+def load_saved_mapping(config):
+    path = get_mapping_config_path(config)
     if not os.path.isfile(path):
         return None
 
@@ -97,14 +131,14 @@ def load_saved_mapping():
     return data
 
 
-def save_mapping(mapping, source_file, sheet_name, df_columns):
+def save_mapping(mapping, source_file, sheet_name, df_columns, config):
     payload = {
         "source_file": os.path.basename(source_file),
         "sheet_name": sheet_name,
         "columns": list(df_columns),
         "mapping": mapping,
     }
-    path = get_mapping_config_path()
+    path = get_mapping_config_path(config)
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, ensure_ascii=False, indent=2)
 
@@ -166,7 +200,7 @@ def id_sort_key(value):
     return (1, value.lower())
 
 
-def build_dedup_link(current_id, duplicate_id):
+def build_dedup_link(current_id, duplicate_id, config):
     current_id = normalize_id_for_compare(current_id)
     duplicate_id = normalize_id_for_compare(duplicate_id)
 
@@ -174,14 +208,15 @@ def build_dedup_link(current_id, duplicate_id):
         return ""
 
     winner_id, loser_id = sorted([current_id, duplicate_id], key=id_sort_key)
-    url = (
-        "https://dc.directchannel.it/nonprofit/nomi_merge.asp"
-        f"?id_cedente={loser_id}&id_vincente={winner_id}"
+    url = str(config["dedup_url_template"]).format(
+        id_cedente=loser_id,
+        id_vincente=winner_id,
     )
-    return f'=HYPERLINK("{url}","Deduplica")'
+    label = str(config["dedup_link_label"])
+    return f'=HYPERLINK("{url}","{label}")'
 
 
-def build_dedup_links_columns(row_ids, duplicate_ids, states):
+def build_dedup_links_columns(row_ids, duplicate_ids, states, config):
     all_links = []
 
     for current_id, duplicates_raw, state in zip(row_ids, duplicate_ids, states):
@@ -195,7 +230,10 @@ def build_dedup_links_columns(row_ids, duplicate_ids, states):
         ]
         duplicates = [item for item in duplicates if item]
 
-        links = [build_dedup_link(current_id, duplicate_id) for duplicate_id in duplicates]
+        links = [
+            build_dedup_link(current_id, duplicate_id, config)
+            for duplicate_id in duplicates
+        ]
         links = [link for link in links if link]
         all_links.append(links)
 
@@ -211,12 +249,12 @@ def build_dedup_links_columns(row_ids, duplicate_ids, states):
     return columns
 
 
-def map_columns(df, source_file=None, sheet_name=None):
+def map_columns(df, config, source_file=None, sheet_name=None):
     print("\nColonne trovate nel file:")
     for idx, col in enumerate(df.columns, start=1):
         print(f"{idx}. {col}")
 
-    saved_data = load_saved_mapping()
+    saved_data = load_saved_mapping(config)
     if saved_data and is_saved_mapping_compatible(saved_data, df):
         saved_mapping = saved_data["mapping"]
         source_label = saved_data.get("source_file") or "file precedente"
@@ -261,8 +299,14 @@ def map_columns(df, source_file=None, sheet_name=None):
     print_mapping(mapping, "\nMappatura confermata:")
 
     if source_file and sheet_name:
-        save_mapping(mapping, source_file=source_file, sheet_name=sheet_name, df_columns=df.columns)
-        print(f"Mappatura salvata in {get_mapping_config_path()}\n")
+        save_mapping(
+            mapping,
+            source_file=source_file,
+            sheet_name=sheet_name,
+            df_columns=df.columns,
+            config=config,
+        )
+        print(f"Mappatura salvata in {get_mapping_config_path(config)}\n")
 
     return mapping
 
@@ -323,7 +367,7 @@ def collect_groups_by_key(values):
     return groups
 
 
-def deduplicate(norm):
+def deduplicate(norm, config):
     """
     norm: dict con chiavi id,email,cf,cell,tel,nome,cognome
     Ritorna:
@@ -335,7 +379,7 @@ def deduplicate(norm):
     prob_dups = [set() for _ in range(n)]
 
     # soglia di similarità per "probabilmente doppia"
-    name_threshold = 0.8
+    name_threshold = float(config["name_similarity_threshold"])
 
     # Pre-gruppi per chiavi principali
     key_names = ["email", "cf", "cell", "tel"]
@@ -396,6 +440,7 @@ def deduplicate(norm):
 
 def main():
     print("=== Deduplica Excel (anagrafiche) ===\n")
+    config = load_app_config()
 
     # 1. Cerca file Excel nella cartella corrente
     current_path = os.getcwd()
@@ -442,19 +487,19 @@ def main():
     df = pd.read_excel(excel_path, sheet_name=sheet_name, dtype=str)
 
     # 5. Mappatura colonne
-    mapping = map_columns(df, source_file=excel_path, sheet_name=sheet_name)
+    mapping = map_columns(df, config, source_file=excel_path, sheet_name=sheet_name)
 
     # 6. Normalizzazione valori
     norm = build_normalized_columns(df, mapping)
 
     # 7. Deduplica
     print("Eseguo la deduplica, potrebbe volerci qualche istante...\n")
-    stato, id_doppi = deduplicate(norm)
+    stato, id_doppi = deduplicate(norm, config)
 
     # 8. Aggiungo le colonne al DataFrame
     df["Stato_dedup"] = stato
     df["ID_doppi"] = id_doppi
-    dedup_link_columns = build_dedup_links_columns(norm["id"], id_doppi, stato)
+    dedup_link_columns = build_dedup_links_columns(norm["id"], id_doppi, stato, config)
     for col_name, values in dedup_link_columns.items():
         df[col_name] = values
 
