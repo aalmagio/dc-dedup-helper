@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+
+.dedup_last_mapping.json
+
+*.csv
+*.xlsx
+*.xlsm
+*.xls
+
+Archivio/
