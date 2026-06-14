@@ -180,16 +180,19 @@ def is_saved_mapping_compatible(saved_data, df):
     if list(df.columns) != saved_columns:
         return False
 
-    for col_name in mapping.values():
-        if col_name is not None and col_name not in df.columns:
-            return False
+    for value in mapping.values():
+        cols = value if isinstance(value, list) else [value]
+        for col_name in cols:
+            if col_name is not None and col_name not in df.columns:
+                return False
     return True
 
 
 def print_mapping(mapping, title):
     print(title)
     for k, v in mapping.items():
-        print(f"  {k}: {v}")
+        shown = ", ".join(v) if isinstance(v, list) else v
+        print(f"  {k}: {shown}")
     print()
 
 
@@ -313,8 +316,10 @@ def map_columns(df, config, source_file=None, sheet_name=None):
     id_col = df.columns[id_idx - 1]
 
     email_idx = input_int("Colonna Email (0 se assente): ", min_val=0, max_val=len(df.columns), allow_zero=True)
+    email2_idx = input_int("Colonna Email secondaria (0 se assente): ", min_val=0, max_val=len(df.columns), allow_zero=True)
     cf_idx = input_int("Colonna Codice Fiscale (0 se assente): ", min_val=0, max_val=len(df.columns), allow_zero=True)
     cell_idx = input_int("Colonna Cellulare (0 se assente): ", min_val=0, max_val=len(df.columns), allow_zero=True)
+    cell2_idx = input_int("Colonna Cellulare secondario (0 se assente): ", min_val=0, max_val=len(df.columns), allow_zero=True)
     tel_idx = input_int("Colonna Telefono fisso (0 se assente): ", min_val=0, max_val=len(df.columns), allow_zero=True)
     nome_idx = input_int("Colonna Nome (0 se assente): ", min_val=0, max_val=len(df.columns), allow_zero=True)
     cognome_idx = input_int("Colonna Cognome (0 se assente): ", min_val=0, max_val=len(df.columns), allow_zero=True)
@@ -324,11 +329,20 @@ def map_columns(df, config, source_file=None, sheet_name=None):
             return None
         return df.columns[idx - 1]
 
+    def cols_list(*idxs):
+        # Raccoglie le colonne indicate (saltando 0 e i duplicati) in una lista.
+        cols = []
+        for idx in idxs:
+            col = col_or_none(idx)
+            if col and col not in cols:
+                cols.append(col)
+        return cols
+
     mapping = {
         "id": id_col,
-        "email": col_or_none(email_idx),
+        "email": cols_list(email_idx, email2_idx),
         "cf": col_or_none(cf_idx),
-        "cell": col_or_none(cell_idx),
+        "cell": cols_list(cell_idx, cell2_idx),
         "tel": col_or_none(tel_idx),
         "nome": col_or_none(nome_idx),
         "cognome": col_or_none(cognome_idx),
@@ -349,48 +363,71 @@ def map_columns(df, config, source_file=None, sheet_name=None):
     return mapping
 
 
-# Funzione di normalizzazione per ciascun campo confrontabile.
-NORMALIZERS = {
-    "email": normalize_string,
+# Funzione di normalizzazione per i campi a valore singolo.
+SINGLE_NORMALIZERS = {
     "cf": lambda v: normalize_string(v).upper(),
-    "cell": normalize_phone,
     "tel": normalize_phone,
     "nome": normalize_string,
     "cognome": normalize_string,
+}
+
+# Campi a valore multiplo: piu colonne confluiscono nello stesso "spazio"
+# (es. Email + Email2). Una riga porta l'insieme dei suoi valori e due righe
+# combaciano se ne condividono uno qualunque, anche incrociato.
+MULTI_NORMALIZERS = {
+    "email": normalize_string,
+    "cell": normalize_phone,
 }
 
 
 def build_normalized_columns(df, mapping):
     """
     Crea colonne normalizzate in un dict separato, per comodità.
-    Restituisce un dict con chiavi:
-    id, email, cf, cell, tel, nome, cognome
-    ciascuna è una lista di lunghezza len(df).
+    Restituisce un dict con chiavi: id, email, cf, cell, tel, nome, cognome.
+    I campi a valore singolo sono liste di stringhe (una per riga); i campi a
+    valore multiplo (email, cell) sono liste di liste (i valori di ogni riga).
     """
     n = len(df)
-    norm = {k: [""] * n for k in ["id", *NORMALIZERS]}
+    norm = {}
 
     # ID: lo manteniamo così com'è (stringa)
     norm["id"] = ["" if pd.isna(v) else str(v) for v in df[mapping["id"]].values]
 
-    for key, normalizer in NORMALIZERS.items():
+    for key, normalizer in SINGLE_NORMALIZERS.items():
         col = mapping.get(key)
         if col:
             norm[key] = [normalizer(v) for v in df[col].values]
+        else:
+            norm[key] = [""] * n
+
+    for key, normalizer in MULTI_NORMALIZERS.items():
+        cols = mapping.get(key) or []
+        if isinstance(cols, str):  # compatibilità con mappature salvate vecchie
+            cols = [cols]
+        per_col = [[normalizer(v) for v in df[col].values] for col in cols]
+        # Per ogni riga: lista dei valori normalizzati non vuoti dalle sue colonne.
+        norm[key] = [
+            [values[i] for values in per_col if values[i]]
+            for i in range(n)
+        ]
 
     return norm
 
 
 def collect_groups_by_key(values):
     """
-    values: lista di stringhe (una per riga) per una singola chiave (es. tutte le email normalizzate)
-    Ritorna dict: valore -> lista di indici (righe) in cui compare, solo se valore non vuoto
+    values: una voce per riga. Ogni voce è una stringa (campo singolo) oppure
+    una lista di stringhe (campo multi-valore, es. Email + Email2).
+    Ritorna dict: valore -> lista di indici (righe) in cui compare, solo se
+    valore non vuoto. Una riga compare una sola volta per ciascun valore.
     """
     groups = {}
     for idx, val in enumerate(values):
-        if not val:
-            continue
-        groups.setdefault(val, []).append(idx)
+        row_values = val if isinstance(val, (list, tuple, set)) else (val,)
+        for v in set(row_values):
+            if not v:
+                continue
+            groups.setdefault(v, []).append(idx)
     # teniamo solo gruppi con almeno 2 righe
     groups = {k: v for k, v in groups.items() if len(v) > 1}
     return groups
