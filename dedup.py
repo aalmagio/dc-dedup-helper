@@ -8,6 +8,19 @@ import pandas as pd
 
 EXCEL_EXT = (".xlsx", ".xlsm", ".xls")
 APP_CONFIG_FILE = "dedup_config.json"
+
+# Etichette di stato (usate anche come chiavi nei controlli successivi)
+STATO_NON_DOPPIA = "non doppia"
+STATO_SICURA = "sicuramente doppia"
+STATO_PROBABILE = "probabilmente doppia"
+
+# Chiavi univoche: se due righe le condividono sono la stessa persona,
+# a prescindere da come è scritto il nome (es. Codice Fiscale).
+STRONG_KEYS = ("cf",)
+# Chiavi deboli: possono essere condivise (es. telefono di famiglia, email
+# di coppia), quindi richiedono anche l'accordo su nome/cognome.
+WEAK_KEYS = ("email", "cell", "tel")
+
 DEFAULT_CONFIG = {
     "dedup_url_template": (
         "https://dc.directchannel.it/nonprofit/nomi_merge.asp"
@@ -106,6 +119,21 @@ def load_app_config():
         if key in user_config:
             config[key] = user_config[key]
 
+    # La soglia deve essere un numero in [0, 1]: la validiamo subito per non
+    # far fallire l'elaborazione a metà (dopo la mappatura interattiva).
+    try:
+        threshold = float(config["name_similarity_threshold"])
+    except (TypeError, ValueError):
+        threshold = None
+    if threshold is None or not 0.0 <= threshold <= 1.0:
+        print(
+            f"Attenzione: 'name_similarity_threshold' non valido in {APP_CONFIG_FILE}, "
+            f"uso il default {DEFAULT_CONFIG['name_similarity_threshold']}."
+        )
+        config["name_similarity_threshold"] = DEFAULT_CONFIG["name_similarity_threshold"]
+    else:
+        config["name_similarity_threshold"] = threshold
+
     return config
 
 
@@ -174,8 +202,13 @@ def normalize_string(s):
 def normalize_phone(s):
     if pd.isna(s):
         return ""
-    s = str(s)
-    digits = "".join(ch for ch in s if ch.isdigit())
+    digits = "".join(ch for ch in str(s) if ch.isdigit())
+    # Rimuove il prefisso internazionale italiano per far combaciare
+    # "+39 333..." / "0039333..." con il numero in formato nazionale.
+    if digits.startswith("0039"):
+        digits = digits[4:]
+    elif digits.startswith("39") and len(digits) > 10:
+        digits = digits[2:]
     return digits
 
 
@@ -220,7 +253,7 @@ def build_dedup_links_columns(row_ids, duplicate_ids, states, config):
     all_links = []
 
     for current_id, duplicates_raw, state in zip(row_ids, duplicate_ids, states):
-        if state not in {"sicuramente doppia", "probabilmente doppia"} or not duplicates_raw:
+        if state not in {STATO_SICURA, STATO_PROBABILE} or not duplicates_raw:
             all_links.append([])
             continue
 
@@ -381,14 +414,20 @@ def deduplicate(norm, config):
     # soglia di similarità per "probabilmente doppia"
     name_threshold = float(config["name_similarity_threshold"])
 
-    # Pre-gruppi per chiavi principali
-    key_names = ["email", "cf", "cell", "tel"]
+    # Chiavi univoche: condividere il valore basta per "sicuramente doppia".
+    for key in STRONG_KEYS:
+        groups = collect_groups_by_key(norm[key])
+        for indices in groups.values():
+            for i in range(len(indices)):
+                for j in range(i + 1, len(indices)):
+                    r1, r2 = indices[i], indices[j]
+                    sure_dups[r1].add(norm["id"][r2])
+                    sure_dups[r2].add(norm["id"][r1])
 
-    for key in key_names:
-        values = norm[key]
-        groups = collect_groups_by_key(values)
-
-        for val, indices in groups.items():
+    # Chiavi deboli: servono anche nome e cognome coincidenti (o simili).
+    for key in WEAK_KEYS:
+        groups = collect_groups_by_key(norm[key])
+        for indices in groups.values():
             # Considera tutte le coppie di righe che condividono questa chiave
             for i in range(len(indices)):
                 for j in range(i + 1, len(indices)):
@@ -398,7 +437,11 @@ def deduplicate(norm, config):
                     nome1, nome2 = norm["nome"][r1], norm["nome"][r2]
                     cog1, cog2 = norm["cognome"][r1], norm["cognome"][r2]
 
-                    names_equal = (nome1 and nome2 and nome1 == nome2 and cog1 == cog2)
+                    # Match esatto: richiede nome E cognome presenti e uguali.
+                    names_equal = (
+                        nome1 and nome2 and cog1 and cog2
+                        and nome1 == nome2 and cog1 == cog2
+                    )
 
                     # Similarità approssimata (se abbiamo entrambi nome e cognome)
                     sim_nome = similarity(nome1, nome2) if nome1 and nome2 else 0.0
@@ -423,13 +466,14 @@ def deduplicate(norm, config):
     for i in range(n):
         # se esistono duplicati sicuri, i "probabili" su quelle stesse righe li ignoriamo
         if sure_dups[i]:
-            label = "sicuramente doppia"
+            label = STATO_SICURA
+            # un id può finire sia tra i sicuri che tra i probabili: evitiamo doppioni
             ids = sorted(sure_dups[i], key=id_sort_key)
         elif prob_dups[i]:
-            label = "probabilmente doppia"
+            label = STATO_PROBABILE
             ids = sorted(prob_dups[i], key=id_sort_key)
         else:
-            label = "non doppia"
+            label = STATO_NON_DOPPIA
             ids = []
 
         stato.append(label)
@@ -507,7 +551,14 @@ def main():
     base, ext = os.path.splitext(excel_path)
     out_path = f"{base}_dedup.xlsx"
 
-    df.to_excel(out_path, sheet_name=sheet_name, index=False)
+    try:
+        df.to_excel(out_path, sheet_name=sheet_name, index=False)
+    except PermissionError:
+        print(
+            f"Impossibile scrivere {out_path}: il file è aperto in Excel o non hai i permessi.\n"
+            "Chiudilo e riprova."
+        )
+        sys.exit(1)
     print(f"Deduplica completata.\nFile salvato come:\n{out_path}")
 
 
