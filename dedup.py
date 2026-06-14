@@ -233,6 +233,11 @@ def id_sort_key(value):
     return (1, value.lower())
 
 
+def escape_excel_string(value):
+    # In una formula Excel le virgolette dentro una stringa si raddoppiano.
+    return str(value).replace('"', '""')
+
+
 def build_dedup_link(current_id, duplicate_id, config):
     current_id = normalize_id_for_compare(current_id)
     duplicate_id = normalize_id_for_compare(duplicate_id)
@@ -246,7 +251,7 @@ def build_dedup_link(current_id, duplicate_id, config):
         id_vincente=winner_id,
     )
     label = str(config["dedup_link_label"])
-    return f'=HYPERLINK("{url}","{label}")'
+    return f'=HYPERLINK("{escape_excel_string(url)}","{escape_excel_string(label)}")'
 
 
 def build_dedup_links_columns(row_ids, duplicate_ids, states, config):
@@ -344,6 +349,17 @@ def map_columns(df, config, source_file=None, sheet_name=None):
     return mapping
 
 
+# Funzione di normalizzazione per ciascun campo confrontabile.
+NORMALIZERS = {
+    "email": normalize_string,
+    "cf": lambda v: normalize_string(v).upper(),
+    "cell": normalize_phone,
+    "tel": normalize_phone,
+    "nome": normalize_string,
+    "cognome": normalize_string,
+}
+
+
 def build_normalized_columns(df, mapping):
     """
     Crea colonne normalizzate in un dict separato, per comodità.
@@ -352,35 +368,15 @@ def build_normalized_columns(df, mapping):
     ciascuna è una lista di lunghezza len(df).
     """
     n = len(df)
-    norm = {k: [""] * n for k in ["id", "email", "cf", "cell", "tel", "nome", "cognome"]}
+    norm = {k: [""] * n for k in ["id", *NORMALIZERS]}
 
     # ID: lo manteniamo così com'è (stringa)
-    id_col = mapping["id"]
-    norm["id"] = ["" if pd.isna(v) else str(v) for v in df[id_col].values]
+    norm["id"] = ["" if pd.isna(v) else str(v) for v in df[mapping["id"]].values]
 
-    # Email
-    if mapping["email"]:
-        norm["email"] = [normalize_string(v) for v in df[mapping["email"]].values]
-
-    # Codice Fiscale
-    if mapping["cf"]:
-        norm["cf"] = [normalize_string(v).upper() for v in df[mapping["cf"]].values]
-
-    # Cellulare
-    if mapping["cell"]:
-        norm["cell"] = [normalize_phone(v) for v in df[mapping["cell"]].values]
-
-    # Telefono fisso
-    if mapping["tel"]:
-        norm["tel"] = [normalize_phone(v) for v in df[mapping["tel"]].values]
-
-    # Nome
-    if mapping["nome"]:
-        norm["nome"] = [normalize_string(v) for v in df[mapping["nome"]].values]
-
-    # Cognome
-    if mapping["cognome"]:
-        norm["cognome"] = [normalize_string(v) for v in df[mapping["cognome"]].values]
+    for key, normalizer in NORMALIZERS.items():
+        col = mapping.get(key)
+        if col:
+            norm[key] = [normalizer(v) for v in df[col].values]
 
     return norm
 
@@ -398,6 +394,13 @@ def collect_groups_by_key(values):
     # teniamo solo gruppi con almeno 2 righe
     groups = {k: v for k, v in groups.items() if len(v) > 1}
     return groups
+
+
+def names_match_similar(nome1, cog1, nome2, cog2, threshold):
+    # Similarità approssimata (solo se abbiamo entrambi nome e cognome).
+    sim_nome = similarity(nome1, nome2) if nome1 and nome2 else 0.0
+    sim_cog = similarity(cog1, cog2) if cog1 and cog2 else 0.0
+    return sim_nome >= threshold and sim_cog >= threshold
 
 
 def deduplicate(norm, config):
@@ -425,40 +428,40 @@ def deduplicate(norm, config):
                     sure_dups[r2].add(norm["id"][r1])
 
     # Chiavi deboli: servono anche nome e cognome coincidenti (o simili).
+    # Per non confrontare ogni coppia di righe (O(k^2) di SequenceMatcher sui
+    # gruppi grandi, es. un telefono fisso condiviso da molti), raggruppiamo
+    # prima per (nome, cognome) normalizzati: il match esatto diventa O(k) e
+    # la similarità si calcola solo tra i bucket distinti (di norma pochi).
     for key in WEAK_KEYS:
         groups = collect_groups_by_key(norm[key])
         for indices in groups.values():
-            # Considera tutte le coppie di righe che condividono questa chiave
-            for i in range(len(indices)):
-                for j in range(i + 1, len(indices)):
-                    r1 = indices[i]
-                    r2 = indices[j]
+            buckets = {}
+            for idx in indices:
+                name_key = (norm["nome"][idx], norm["cognome"][idx])
+                buckets.setdefault(name_key, []).append(idx)
 
-                    nome1, nome2 = norm["nome"][r1], norm["nome"][r2]
-                    cog1, cog2 = norm["cognome"][r1], norm["cognome"][r2]
+            # Match esatto: stesso nome e cognome (entrambi presenti).
+            for (nome, cog), rows in buckets.items():
+                if not (nome and cog) or len(rows) < 2:
+                    continue
+                for i in range(len(rows)):
+                    for j in range(i + 1, len(rows)):
+                        r1, r2 = rows[i], rows[j]
+                        sure_dups[r1].add(norm["id"][r2])
+                        sure_dups[r2].add(norm["id"][r1])
 
-                    # Match esatto: richiede nome E cognome presenti e uguali.
-                    names_equal = (
-                        nome1 and nome2 and cog1 and cog2
-                        and nome1 == nome2 and cog1 == cog2
-                    )
-
-                    # Similarità approssimata (se abbiamo entrambi nome e cognome)
-                    sim_nome = similarity(nome1, nome2) if nome1 and nome2 else 0.0
-                    sim_cog = similarity(cog1, cog2) if cog1 and cog2 else 0.0
-                    names_similar = (sim_nome >= name_threshold and sim_cog >= name_threshold)
-
-                    id1 = norm["id"][r1]
-                    id2 = norm["id"][r2]
-
-                    if names_equal:
-                        # sicuramente doppia
-                        sure_dups[r1].add(id2)
-                        sure_dups[r2].add(id1)
-                    elif names_similar:
-                        # probabilmente doppia
-                        prob_dups[r1].add(id2)
-                        prob_dups[r2].add(id1)
+            # Match simile: confronto solo tra bucket distinti.
+            bucket_items = list(buckets.items())
+            for a in range(len(bucket_items)):
+                (nome1, cog1), rows1 = bucket_items[a]
+                for b in range(a + 1, len(bucket_items)):
+                    (nome2, cog2), rows2 = bucket_items[b]
+                    if not names_match_similar(nome1, cog1, nome2, cog2, name_threshold):
+                        continue
+                    for r1 in rows1:
+                        for r2 in rows2:
+                            prob_dups[r1].add(norm["id"][r2])
+                            prob_dups[r2].add(norm["id"][r1])
 
     stato = []
     id_doppi = []
