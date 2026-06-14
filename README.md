@@ -11,6 +11,7 @@ Funzionalita principali:
 - mappatura interattiva delle colonne del tracciato
 - riutilizzo della mappatura colonne salvata tra esecuzioni successive
 - identificazione di contatti `sicuramente doppia` e `probabilmente doppia`
+- supporto a email e cellulare secondari (`Email2`, `Cellulare2`) con confronto incrociato
 - generazione automatica dei link di deduplica
 - configurazione esterna del template URL e di alcune variabili operative
 
@@ -38,3 +39,27 @@ python dedup.py
 ```
 
 Lo script cerca file Excel nella cartella corrente, chiede il foglio da elaborare e guida la mappatura delle colonne necessarie.
+
+## Mappatura consigliata per i tracciati Mentor
+
+I tracciati Mentor che usiamo contengono questi campi, da mappare cosi:
+
+| Campo del tracciato | Campo nello script |
+|---------------------|--------------------|
+| ID Cliente          | ID univoco         |
+| Codice Fiscale      | Codice Fiscale     |
+| Email               | Email              |
+| Email2              | Email secondaria   |
+| Cellulare           | Cellulare          |
+| Cellulare2          | Cellulare secondario |
+| Telefono            | Telefono fisso     |
+| Nome                | Nome               |
+| Cognome             | Cognome            |
+
+Email/Email2 e Cellulare/Cellulare2 vengono confrontati in modo incrociato: due
+righe sono considerate doppie se condividono una qualunque email o un qualunque
+cellulare, anche se uno e nel campo principale e l'altro nel secondario.
+
+**Importante:** come "ID univoco" usa sempre **ID Cliente**, non il Codice
+Fiscale. La deduplica automatica tramite link in Mentor funziona solo con
+l'ID Cliente; i link costruiti sul Codice Fiscale non sono validi.

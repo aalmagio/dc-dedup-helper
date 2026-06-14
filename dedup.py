@@ -8,6 +8,19 @@ import pandas as pd
 
 EXCEL_EXT = (".xlsx", ".xlsm", ".xls")
 APP_CONFIG_FILE = "dedup_config.json"
+
+# Etichette di stato (usate anche come chiavi nei controlli successivi)
+STATO_NON_DOPPIA = "non doppia"
+STATO_SICURA = "sicuramente doppia"
+STATO_PROBABILE = "probabilmente doppia"
+
+# Chiavi univoche: se due righe le condividono sono la stessa persona,
+# a prescindere da come è scritto il nome (es. Codice Fiscale).
+STRONG_KEYS = ("cf",)
+# Chiavi deboli: possono essere condivise (es. telefono di famiglia, email
+# di coppia), quindi richiedono anche l'accordo su nome/cognome.
+WEAK_KEYS = ("email", "cell", "tel")
+
 DEFAULT_CONFIG = {
     "dedup_url_template": (
         "https://dc.directchannel.it/nonprofit/nomi_merge.asp"
@@ -106,6 +119,21 @@ def load_app_config():
         if key in user_config:
             config[key] = user_config[key]
 
+    # La soglia deve essere un numero in [0, 1]: la validiamo subito per non
+    # far fallire l'elaborazione a metà (dopo la mappatura interattiva).
+    try:
+        threshold = float(config["name_similarity_threshold"])
+    except (TypeError, ValueError):
+        threshold = None
+    if threshold is None or not 0.0 <= threshold <= 1.0:
+        print(
+            f"Attenzione: 'name_similarity_threshold' non valido in {APP_CONFIG_FILE}, "
+            f"uso il default {DEFAULT_CONFIG['name_similarity_threshold']}."
+        )
+        config["name_similarity_threshold"] = DEFAULT_CONFIG["name_similarity_threshold"]
+    else:
+        config["name_similarity_threshold"] = threshold
+
     return config
 
 
@@ -152,16 +180,19 @@ def is_saved_mapping_compatible(saved_data, df):
     if list(df.columns) != saved_columns:
         return False
 
-    for col_name in mapping.values():
-        if col_name is not None and col_name not in df.columns:
-            return False
+    for value in mapping.values():
+        cols = value if isinstance(value, list) else [value]
+        for col_name in cols:
+            if col_name is not None and col_name not in df.columns:
+                return False
     return True
 
 
 def print_mapping(mapping, title):
     print(title)
     for k, v in mapping.items():
-        print(f"  {k}: {v}")
+        shown = ", ".join(v) if isinstance(v, list) else v
+        print(f"  {k}: {shown}")
     print()
 
 
@@ -174,8 +205,13 @@ def normalize_string(s):
 def normalize_phone(s):
     if pd.isna(s):
         return ""
-    s = str(s)
-    digits = "".join(ch for ch in s if ch.isdigit())
+    digits = "".join(ch for ch in str(s) if ch.isdigit())
+    # Rimuove il prefisso internazionale italiano per far combaciare
+    # "+39 333..." / "0039333..." con il numero in formato nazionale.
+    if digits.startswith("0039"):
+        digits = digits[4:]
+    elif digits.startswith("39") and len(digits) > 10:
+        digits = digits[2:]
     return digits
 
 
@@ -200,6 +236,11 @@ def id_sort_key(value):
     return (1, value.lower())
 
 
+def escape_excel_string(value):
+    # In una formula Excel le virgolette dentro una stringa si raddoppiano.
+    return str(value).replace('"', '""')
+
+
 def build_dedup_link(current_id, duplicate_id, config):
     current_id = normalize_id_for_compare(current_id)
     duplicate_id = normalize_id_for_compare(duplicate_id)
@@ -213,14 +254,14 @@ def build_dedup_link(current_id, duplicate_id, config):
         id_vincente=winner_id,
     )
     label = str(config["dedup_link_label"])
-    return f'=HYPERLINK("{url}","{label}")'
+    return f'=HYPERLINK("{escape_excel_string(url)}","{escape_excel_string(label)}")'
 
 
 def build_dedup_links_columns(row_ids, duplicate_ids, states, config):
     all_links = []
 
     for current_id, duplicates_raw, state in zip(row_ids, duplicate_ids, states):
-        if state not in {"sicuramente doppia", "probabilmente doppia"} or not duplicates_raw:
+        if state not in {STATO_SICURA, STATO_PROBABILE} or not duplicates_raw:
             all_links.append([])
             continue
 
@@ -275,8 +316,10 @@ def map_columns(df, config, source_file=None, sheet_name=None):
     id_col = df.columns[id_idx - 1]
 
     email_idx = input_int("Colonna Email (0 se assente): ", min_val=0, max_val=len(df.columns), allow_zero=True)
+    email2_idx = input_int("Colonna Email secondaria (0 se assente): ", min_val=0, max_val=len(df.columns), allow_zero=True)
     cf_idx = input_int("Colonna Codice Fiscale (0 se assente): ", min_val=0, max_val=len(df.columns), allow_zero=True)
     cell_idx = input_int("Colonna Cellulare (0 se assente): ", min_val=0, max_val=len(df.columns), allow_zero=True)
+    cell2_idx = input_int("Colonna Cellulare secondario (0 se assente): ", min_val=0, max_val=len(df.columns), allow_zero=True)
     tel_idx = input_int("Colonna Telefono fisso (0 se assente): ", min_val=0, max_val=len(df.columns), allow_zero=True)
     nome_idx = input_int("Colonna Nome (0 se assente): ", min_val=0, max_val=len(df.columns), allow_zero=True)
     cognome_idx = input_int("Colonna Cognome (0 se assente): ", min_val=0, max_val=len(df.columns), allow_zero=True)
@@ -286,11 +329,20 @@ def map_columns(df, config, source_file=None, sheet_name=None):
             return None
         return df.columns[idx - 1]
 
+    def cols_list(*idxs):
+        # Raccoglie le colonne indicate (saltando 0 e i duplicati) in una lista.
+        cols = []
+        for idx in idxs:
+            col = col_or_none(idx)
+            if col and col not in cols:
+                cols.append(col)
+        return cols
+
     mapping = {
         "id": id_col,
-        "email": col_or_none(email_idx),
+        "email": cols_list(email_idx, email2_idx),
         "cf": col_or_none(cf_idx),
-        "cell": col_or_none(cell_idx),
+        "cell": cols_list(cell_idx, cell2_idx),
         "tel": col_or_none(tel_idx),
         "nome": col_or_none(nome_idx),
         "cognome": col_or_none(cognome_idx),
@@ -311,60 +363,81 @@ def map_columns(df, config, source_file=None, sheet_name=None):
     return mapping
 
 
+# Funzione di normalizzazione per i campi a valore singolo.
+SINGLE_NORMALIZERS = {
+    "cf": lambda v: normalize_string(v).upper(),
+    "tel": normalize_phone,
+    "nome": normalize_string,
+    "cognome": normalize_string,
+}
+
+# Campi a valore multiplo: piu colonne confluiscono nello stesso "spazio"
+# (es. Email + Email2). Una riga porta l'insieme dei suoi valori e due righe
+# combaciano se ne condividono uno qualunque, anche incrociato.
+MULTI_NORMALIZERS = {
+    "email": normalize_string,
+    "cell": normalize_phone,
+}
+
+
 def build_normalized_columns(df, mapping):
     """
     Crea colonne normalizzate in un dict separato, per comodità.
-    Restituisce un dict con chiavi:
-    id, email, cf, cell, tel, nome, cognome
-    ciascuna è una lista di lunghezza len(df).
+    Restituisce un dict con chiavi: id, email, cf, cell, tel, nome, cognome.
+    I campi a valore singolo sono liste di stringhe (una per riga); i campi a
+    valore multiplo (email, cell) sono liste di liste (i valori di ogni riga).
     """
     n = len(df)
-    norm = {k: [""] * n for k in ["id", "email", "cf", "cell", "tel", "nome", "cognome"]}
+    norm = {}
 
     # ID: lo manteniamo così com'è (stringa)
-    id_col = mapping["id"]
-    norm["id"] = ["" if pd.isna(v) else str(v) for v in df[id_col].values]
+    norm["id"] = ["" if pd.isna(v) else str(v) for v in df[mapping["id"]].values]
 
-    # Email
-    if mapping["email"]:
-        norm["email"] = [normalize_string(v) for v in df[mapping["email"]].values]
+    for key, normalizer in SINGLE_NORMALIZERS.items():
+        col = mapping.get(key)
+        if col:
+            norm[key] = [normalizer(v) for v in df[col].values]
+        else:
+            norm[key] = [""] * n
 
-    # Codice Fiscale
-    if mapping["cf"]:
-        norm["cf"] = [normalize_string(v).upper() for v in df[mapping["cf"]].values]
-
-    # Cellulare
-    if mapping["cell"]:
-        norm["cell"] = [normalize_phone(v) for v in df[mapping["cell"]].values]
-
-    # Telefono fisso
-    if mapping["tel"]:
-        norm["tel"] = [normalize_phone(v) for v in df[mapping["tel"]].values]
-
-    # Nome
-    if mapping["nome"]:
-        norm["nome"] = [normalize_string(v) for v in df[mapping["nome"]].values]
-
-    # Cognome
-    if mapping["cognome"]:
-        norm["cognome"] = [normalize_string(v) for v in df[mapping["cognome"]].values]
+    for key, normalizer in MULTI_NORMALIZERS.items():
+        cols = mapping.get(key) or []
+        if isinstance(cols, str):  # compatibilità con mappature salvate vecchie
+            cols = [cols]
+        per_col = [[normalizer(v) for v in df[col].values] for col in cols]
+        # Per ogni riga: lista dei valori normalizzati non vuoti dalle sue colonne.
+        norm[key] = [
+            [values[i] for values in per_col if values[i]]
+            for i in range(n)
+        ]
 
     return norm
 
 
 def collect_groups_by_key(values):
     """
-    values: lista di stringhe (una per riga) per una singola chiave (es. tutte le email normalizzate)
-    Ritorna dict: valore -> lista di indici (righe) in cui compare, solo se valore non vuoto
+    values: una voce per riga. Ogni voce è una stringa (campo singolo) oppure
+    una lista di stringhe (campo multi-valore, es. Email + Email2).
+    Ritorna dict: valore -> lista di indici (righe) in cui compare, solo se
+    valore non vuoto. Una riga compare una sola volta per ciascun valore.
     """
     groups = {}
     for idx, val in enumerate(values):
-        if not val:
-            continue
-        groups.setdefault(val, []).append(idx)
+        row_values = val if isinstance(val, (list, tuple, set)) else (val,)
+        for v in set(row_values):
+            if not v:
+                continue
+            groups.setdefault(v, []).append(idx)
     # teniamo solo gruppi con almeno 2 righe
     groups = {k: v for k, v in groups.items() if len(v) > 1}
     return groups
+
+
+def names_match_similar(nome1, cog1, nome2, cog2, threshold):
+    # Similarità approssimata (solo se abbiamo entrambi nome e cognome).
+    sim_nome = similarity(nome1, nome2) if nome1 and nome2 else 0.0
+    sim_cog = similarity(cog1, cog2) if cog1 and cog2 else 0.0
+    return sim_nome >= threshold and sim_cog >= threshold
 
 
 def deduplicate(norm, config):
@@ -381,41 +454,51 @@ def deduplicate(norm, config):
     # soglia di similarità per "probabilmente doppia"
     name_threshold = float(config["name_similarity_threshold"])
 
-    # Pre-gruppi per chiavi principali
-    key_names = ["email", "cf", "cell", "tel"]
-
-    for key in key_names:
-        values = norm[key]
-        groups = collect_groups_by_key(values)
-
-        for val, indices in groups.items():
-            # Considera tutte le coppie di righe che condividono questa chiave
+    # Chiavi univoche: condividere il valore basta per "sicuramente doppia".
+    for key in STRONG_KEYS:
+        groups = collect_groups_by_key(norm[key])
+        for indices in groups.values():
             for i in range(len(indices)):
                 for j in range(i + 1, len(indices)):
-                    r1 = indices[i]
-                    r2 = indices[j]
+                    r1, r2 = indices[i], indices[j]
+                    sure_dups[r1].add(norm["id"][r2])
+                    sure_dups[r2].add(norm["id"][r1])
 
-                    nome1, nome2 = norm["nome"][r1], norm["nome"][r2]
-                    cog1, cog2 = norm["cognome"][r1], norm["cognome"][r2]
+    # Chiavi deboli: servono anche nome e cognome coincidenti (o simili).
+    # Per non confrontare ogni coppia di righe (O(k^2) di SequenceMatcher sui
+    # gruppi grandi, es. un telefono fisso condiviso da molti), raggruppiamo
+    # prima per (nome, cognome) normalizzati: il match esatto diventa O(k) e
+    # la similarità si calcola solo tra i bucket distinti (di norma pochi).
+    for key in WEAK_KEYS:
+        groups = collect_groups_by_key(norm[key])
+        for indices in groups.values():
+            buckets = {}
+            for idx in indices:
+                name_key = (norm["nome"][idx], norm["cognome"][idx])
+                buckets.setdefault(name_key, []).append(idx)
 
-                    names_equal = (nome1 and nome2 and nome1 == nome2 and cog1 == cog2)
+            # Match esatto: stesso nome e cognome (entrambi presenti).
+            for (nome, cog), rows in buckets.items():
+                if not (nome and cog) or len(rows) < 2:
+                    continue
+                for i in range(len(rows)):
+                    for j in range(i + 1, len(rows)):
+                        r1, r2 = rows[i], rows[j]
+                        sure_dups[r1].add(norm["id"][r2])
+                        sure_dups[r2].add(norm["id"][r1])
 
-                    # Similarità approssimata (se abbiamo entrambi nome e cognome)
-                    sim_nome = similarity(nome1, nome2) if nome1 and nome2 else 0.0
-                    sim_cog = similarity(cog1, cog2) if cog1 and cog2 else 0.0
-                    names_similar = (sim_nome >= name_threshold and sim_cog >= name_threshold)
-
-                    id1 = norm["id"][r1]
-                    id2 = norm["id"][r2]
-
-                    if names_equal:
-                        # sicuramente doppia
-                        sure_dups[r1].add(id2)
-                        sure_dups[r2].add(id1)
-                    elif names_similar:
-                        # probabilmente doppia
-                        prob_dups[r1].add(id2)
-                        prob_dups[r2].add(id1)
+            # Match simile: confronto solo tra bucket distinti.
+            bucket_items = list(buckets.items())
+            for a in range(len(bucket_items)):
+                (nome1, cog1), rows1 = bucket_items[a]
+                for b in range(a + 1, len(bucket_items)):
+                    (nome2, cog2), rows2 = bucket_items[b]
+                    if not names_match_similar(nome1, cog1, nome2, cog2, name_threshold):
+                        continue
+                    for r1 in rows1:
+                        for r2 in rows2:
+                            prob_dups[r1].add(norm["id"][r2])
+                            prob_dups[r2].add(norm["id"][r1])
 
     stato = []
     id_doppi = []
@@ -423,13 +506,14 @@ def deduplicate(norm, config):
     for i in range(n):
         # se esistono duplicati sicuri, i "probabili" su quelle stesse righe li ignoriamo
         if sure_dups[i]:
-            label = "sicuramente doppia"
+            label = STATO_SICURA
+            # un id può finire sia tra i sicuri che tra i probabili: evitiamo doppioni
             ids = sorted(sure_dups[i], key=id_sort_key)
         elif prob_dups[i]:
-            label = "probabilmente doppia"
+            label = STATO_PROBABILE
             ids = sorted(prob_dups[i], key=id_sort_key)
         else:
-            label = "non doppia"
+            label = STATO_NON_DOPPIA
             ids = []
 
         stato.append(label)
@@ -507,7 +591,14 @@ def main():
     base, ext = os.path.splitext(excel_path)
     out_path = f"{base}_dedup.xlsx"
 
-    df.to_excel(out_path, sheet_name=sheet_name, index=False)
+    try:
+        df.to_excel(out_path, sheet_name=sheet_name, index=False)
+    except PermissionError:
+        print(
+            f"Impossibile scrivere {out_path}: il file è aperto in Excel o non hai i permessi.\n"
+            "Chiudilo e riprova."
+        )
+        sys.exit(1)
     print(f"Deduplica completata.\nFile salvato come:\n{out_path}")
 
 
